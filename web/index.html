@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>APSRTC Live Bus Tracker</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    :root { --from: #2563eb; --to: #ea580c; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; font: 14px/1.4 system-ui, sans-serif; color: #111; }
+    #map { position: absolute; inset: 0; z-index: 0; }
+    .panel { position: absolute; top: 12px; left: 12px; z-index: 1000; width: 320px; max-width: calc(100vw - 24px);
+             background: #fff; border-radius: 12px; box-shadow: 0 6px 24px rgba(0,0,0,.18); padding: 14px; }
+    h1 { font-size: 16px; margin: 0 0 2px; }
+    .sub { color: #666; font-size: 12px; margin: 0 0 12px; }
+    .search { position: relative; }
+    #town { width: 100%; padding: 10px 12px; font-size: 15px; border: 1px solid #cbd5e1; border-radius: 8px; }
+    #suggest { list-style: none; margin: 4px 0 0; padding: 0; position: absolute; left: 0; right: 0; z-index: 1001;
+               background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; max-height: 300px; overflow: auto;
+               box-shadow: 0 8px 20px rgba(0,0,0,.12); }
+    #suggest li { padding: 8px 12px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+    #suggest li:hover { background: #f1f5f9; }
+    #suggest li span { color: #94a3b8; font-size: 11px; white-space: nowrap; }
+    .legend { display: flex; gap: 14px; margin: 12px 0 8px; font-size: 13px; }
+    .legend b { font-weight: 600; }
+    .dot { display: inline-block; width: 11px; height: 11px; border-radius: 50%; border: 2px solid #fff;
+           box-shadow: 0 0 0 1px #0002; vertical-align: -1px; margin-right: 5px; }
+    .stat { display: flex; gap: 16px; font-size: 12px; color: #475569; border-top: 1px solid #eef2f7; padding-top: 8px; }
+    .stat b { color: #111; font-size: 15px; }
+    #status { margin-top: 10px; font-size: 12px; color: #334155; min-height: 16px; }
+    .feedwrap { margin-top: 10px; border-top: 1px solid #eef2f7; padding-top: 8px; }
+    .feedhdr { font-size: 12px; font-weight: 600; color: #334155; margin-bottom: 4px; }
+    .feedhdr small { font-weight: 400; color: #94a3b8; }
+    #feed { list-style: none; margin: 0; padding: 0; max-height: 200px; overflow: auto; }
+    #feed li { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 0; border-bottom: 1px solid #f6f8fb; }
+    #feed li.start { animation: flash 1.2s ease-out; }
+    #feed li.stop b { color: #94a3b8; }
+    #feed .t { color: #94a3b8; font-variant-numeric: tabular-nums; }
+    #feed .rt { color: #64748b; margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px; }
+    @keyframes flash { from { background: #dbeafe; } to { background: transparent; } }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <h1>APSRTC Live Bus Tracker</h1>
+    <p class="sub">Pick a town — see live buses leaving and arriving, both directions.</p>
+    <div class="search">
+      <input id="town" type="text" placeholder="Search a town… (e.g. Repalle)" autocomplete="off" spellcheck="false">
+      <ul id="suggest" hidden></ul>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--from)"></i><b>Departing</b> <span id="countFrom">0</span></span>
+      <span><i class="dot" style="background:var(--to)"></i><b>Arriving</b> <span id="countTo">0</span></span>
+    </div>
+    <div class="stat">
+      <span>Scheduled <b id="countSched">0</b></span>
+      <span>Live now <b id="countLive">—</b></span>
+      <span>In view <b id="countView">0</b></span>
+    </div>
+    <div id="status">Loading…</div>
+    <div class="feedwrap">
+      <div class="feedhdr">Live activity <small>(starts &amp; stops)</small></div>
+      <ul id="feed"></ul>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="config.js"></script>
+  <script src="places.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
