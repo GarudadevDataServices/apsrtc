@@ -1,5 +1,5 @@
 /* APSRTC live bus tracker — static, no backend.
-   Pieces: q-token encoder (deflate-raw + AES-256-GCM), services/all sweep,
+   Pieces: direct Firestore serviceDetails query (2 calls/town, true master routes),
    tiered Firestore batchGet poller (on-screen buses first), Leaflet canvas map. */
 "use strict";
 const C = window.CONFIG;
@@ -8,43 +8,13 @@ const FS = `https://firestore.googleapis.com/v1/${FS_ROOT}`;
 // Only the fields the map and popup use — keeps each batch response small.
 const TRACK_FIELDS = ["latitude", "longitude", "locationTime", "refreshedAt", "speed",
   "locationBearing", "busNumber", "vehicleNumber", "depotName"];
-
-/* ---------- q-token encoder (mirrors the Flutter app) ---------- */
-let Q_KEY;
-async function qKey() {
-  if (!Q_KEY) {
-    const raw = Uint8Array.from(atob(C.Q_KEY_B64), c => c.charCodeAt(0));
-    Q_KEY = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt"]);
-  }
-  return Q_KEY;
-}
-async function deflateRaw(bytes) {
-  const cs = new CompressionStream("deflate-raw");
-  const w = cs.writable.getWriter();
-  w.write(bytes); w.close();
-  return new Uint8Array(await new Response(cs.readable).arrayBuffer());
-}
-function b64url(bytes) {
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-async function encodeQ(obj) {
-  const comp = await deflateRaw(new TextEncoder().encode(JSON.stringify(obj)));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await qKey(), comp));
-  const out = new Uint8Array(13 + ct.length);
-  out[0] = 1; out.set(iv, 1); out.set(ct, 13);
-  return b64url(out);
-}
+const SERVICE_FIELDS = ["oprsNo", "serviceType", "sourceName", "destinationName",
+  "routeName", "serviceStartTime", "serviceEndTime", "depotName"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 /* ---------- small helpers ---------- */
 const [PID, LINK, NAME, MANDAL, DIST, LAT, LON, FLAGS] = [0, 1, 2, 3, 4, 5, 6, 7];
-function haversine(a, b) {
-  const R = 6371, dLat = (b[LAT] - a[LAT]) * Math.PI / 180, dLon = (b[LON] - a[LON]) * Math.PI / 180;
-  const s = Math.sin(dLat / 2) ** 2 + Math.cos(a[LAT] * Math.PI / 180) * Math.cos(b[LAT] * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(s));
-}
+
 async function pool(items, n, fn) {
   let i = 0;
   await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
@@ -65,14 +35,89 @@ function uv(v) { // unwrap one Firestore typed value
   if ("arrayValue" in v) return (v.arrayValue.values || []).map(uv);
   return null;
 }
+function unwrapFields(fields) {
+  return Object.fromEntries(Object.entries(fields || {}).map(([k, v]) => [k, uv(v)]));
+}
 
-/* ---------- API ---------- */
-async function fetchServices(srcId, dstId, signal) {
-  const q = await encodeQ({ sourceLinkId: srcId, destinationLinkId: dstId, sourcePlaceId: srcId, destinationPlaceId: dstId });
-  const r = await fetch(`${C.API}/services/all?q=${encodeURIComponent(q)}`,
-    { signal, headers: { "Accept": "application/json", "userId": C.USER_ID, "x-api-key": C.X_API_KEY } });
+// Format IST date as "DD-MMM-YYYY" (matches Firestore serviceDetails.journeyDate).
+function formatISTDate(ms) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata", day: "2-digit", month: "numeric", year: "numeric"
+  }).formatToParts(new Date(ms));
+  const get = t => parts.find(p => p.type === t)?.value;
+  return `${get("day")}-${MONTHS[+get("month") - 1]}-${get("year")}`;
+}
+function nowHourIST() {
+  return +new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata", hour: "2-digit", hour12: false
+  }).format(new Date());
+}
+
+/* ---------- Firestore API ---------- */
+async function queryServiceDetails(fieldPath, placeId, dates, signal) {
+  const dateFilter = dates.length === 1
+    ? { fieldFilter: { field: { fieldPath: "journeyDate" }, op: "EQUAL", value: { stringValue: dates[0] } } }
+    : { fieldFilter: { field: { fieldPath: "journeyDate" }, op: "IN", value: { arrayValue: { values: dates.map(d => ({ stringValue: d })) } } } };
+
+  const body = {
+    structuredQuery: {
+      select: { fields: SERVICE_FIELDS.map(f => ({ fieldPath: f })) },
+      from: [{ collectionId: "serviceDetails" }],
+      where: {
+        compositeFilter: {
+          op: "AND",
+          filters: [
+            { fieldFilter: { field: { fieldPath }, op: "EQUAL", value: { integerValue: String(placeId) } } },
+            dateFilter,
+          ],
+        },
+      },
+      limit: 5000,
+    },
+  };
+
+  const r = await fetch(`${FS}:runQuery?key=${C.FS_KEY}`, {
+    method: "POST", signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
   if (!r.ok) return [];
-  return (await r.json()).data || [];
+  const rows = [];
+  for (const item of await r.json()) {
+    if (!item.document) continue;
+    const docId = item.document.name.slice(item.document.name.lastIndexOf("/") + 1);
+    const f = unwrapFields(item.document.fields);
+    rows.push({
+      serviceDocId: docId,
+      oprsNo: f.oprsNo || "",
+      serviceType: f.serviceType || "",
+      sourceName: f.sourceName || "",
+      destinationName: f.destinationName || "",
+      routeName: f.routeName || "",
+      serviceStartTime: f.serviceStartTime || "",
+      serviceEndTime: f.serviceEndTime || "",
+      depotName: f.depotName || "",
+    });
+  }
+  return rows;
+}
+
+async function fetchTownTrips(town, signal) {
+  const now = Date.now();
+  const dates = [formatISTDate(now)];
+  // Before 09:00 IST, include yesterday's date to catch overnight long-distance buses.
+  if (nowHourIST() < 9) dates.push(formatISTDate(now - 86400000));
+
+  const useExactId = town[LINK] > 0;
+  const [fromRows, toRows] = await Promise.all([
+    queryServiceDetails(useExactId ? "sourceId" : "sourceLinkId", town[PID], dates, signal),
+    queryServiceDetails(useExactId ? "destinationId" : "destinationLinkId", town[PID], dates, signal),
+  ]);
+
+  const trips = new Map();
+  for (const svc of fromRows) trips.set(svc.serviceDocId, { dir: "from", svc });
+  for (const svc of toRows) {
+    if (!trips.has(svc.serviceDocId)) trips.set(svc.serviceDocId, { dir: "to", svc });
+  }
+  return [...trips.values()];
 }
 
 // Many tracking docs in few requests: Firestore batchGet + field mask.
@@ -94,22 +139,9 @@ async function batchTracking(ids, signal) {
     for (const x of await r.json()) {
       if (!x.found) continue;
       const id = x.found.name.slice(x.found.name.lastIndexOf("/") + 1);
-      out.set(id, Object.fromEntries(Object.entries(x.found.fields || {}).map(([k, v]) => [k, uv(v)])));
+      out.set(id, unwrapFields(x.found.fields));
     }
   });
-  return out;
-}
-
-/* ---------- candidate destinations around a town ---------- */
-function candidates(town) {
-  const pick = (flag, maxKm, cap) => PLACES
-    .filter(p => (p[FLAGS] & flag) && p[PID] !== town[PID])
-    .map(p => [p, haversine(town, p)])
-    .filter(x => x[1] > 0 && x[1] <= maxKm)
-    .sort((a, b) => a[1] - b[1]).slice(0, cap).map(x => x[0]);
-  const seen = new Set([town[PID]]), out = [];
-  for (const p of [...pick(1, C.HQ_RADIUS_KM, C.HQ_CAP), ...pick(2, C.DEPOT_RADIUS_KM, C.DEPOT_CAP)])
-    if (!seen.has(p[PID])) { seen.add(p[PID]); out.push(p); }
   return out;
 }
 
@@ -130,15 +162,22 @@ function initMap() {
 }
 function viewBounds() { return map.getBounds().pad(C.VIEW_PAD); }
 
+function tooltipHtml(svc, t) {
+  const spd = t && t.speed != null ? ` · ${Math.round(+t.speed)} km/h` : "";
+  return `<b>${svc.oprsNo || "?"}</b> · ${svc.sourceName || ""} → ${svc.destinationName || ""}${spd}`;
+}
+
 function popupHtml(dir, svc, t) {
   const upd = t && t.locationTime ? new Date(+t.locationTime).toLocaleTimeString() : "—";
   const spd = t && t.speed != null ? Math.round(+t.speed) + " km/h" : "";
   const bus = t && (t.busNumber || t.vehicleNumber) || "?";
-  return `<b>${svc.oprsNo || "?"}</b> · ${svc.serviceType || ""}<br>
+  const depot = (t && t.depotName) || svc.depotName || "";
+  const route = svc.routeName ? ` (${svc.routeName})` : "";
+  return `<b>${svc.oprsNo || "?"}</b> · ${svc.serviceType || ""}${route}<br>
     ${dir === "from" ? "Departing" : "Arriving at"} <b>${window.SELECTED.name}</b><br>
     ${svc.sourceName || ""} → ${svc.destinationName || ""}<br>
     Bus ${bus} · ${spd}<br>
-    <small>${t && t.depotName ? t.depotName + " depot · " : ""}dep ${svc.serviceStartTime || "?"} · GPS ${upd}</small>`;
+    <small>${depot ? depot + " depot · " : ""}dep ${svc.serviceStartTime || "?"} · GPS ${upd}</small>`;
 }
 
 function upsertBus(docId, dir, svc, t) {
@@ -149,18 +188,22 @@ function upsertBus(docId, dir, svc, t) {
       renderer: canvasRenderer, radius: RADIUS, weight: 2, color: "#fff",
       fillColor: COLORS[dir], fillOpacity: 0.95,
     }).addTo(map);
-    b = { dir, marker, from: [lat, lng], to: [lat, lng], t0: 0, k: 1, pulseUntil: 0 };
+    b = { dir, marker, from: [lat, lng], to: [lat, lng], t0: 0, k: 1, pulseUntil: 0, svc, t };
+    marker.bindTooltip(tooltipHtml(svc, t), { direction: "top", offset: [0, -6] });
     marker.on("click", () => marker.bindPopup(popupHtml(b.dir, b.svc, b.t)).openPopup());
     buses.set(docId, b);
-  } else if (b.to[0] !== lat || b.to[1] !== lng) {
-    const ll = b.marker.getLatLng();
-    b.from = [ll.lat, ll.lng];
-    b.to = [lat, lng];
-    b.t0 = performance.now();
-    b.k = 0;
-    kick();
+  } else {
+    if (b.to[0] !== lat || b.to[1] !== lng) {
+      const ll = b.marker.getLatLng();
+      b.from = [ll.lat, ll.lng];
+      b.to = [lat, lng];
+      b.t0 = performance.now();
+      b.k = 0;
+      kick();
+    }
+    b.svc = svc; b.t = t;
+    b.marker.setTooltipContent(tooltipHtml(svc, t));
   }
-  b.svc = svc; b.t = t;
   if (b.marker.isPopupOpen()) b.marker.setPopupContent(popupHtml(b.dir, b.svc, b.t));
 }
 function removeBus(docId) {
@@ -196,28 +239,18 @@ function animate() {
 }
 
 /* ---------- start/stop event feed ---------- */
-function logEvent(kind, dir, svc) {
+function logEvent(kind, dir, svc, timeMs) {
   const feed = document.getElementById("feed");
   const li = document.createElement("li");
-  li.className = kind; // "start" | "stop"
-  const verb = kind === "start" ? (dir === "from" ? "departed" : "inbound to") : "ended";
-  li.innerHTML = `<span class="t">${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+  li.className = kind; // "start" | "stop" | "init"
+  const verb = kind === "stop" ? "ended" : (dir === "from" ? "to" : "from");
+  const ts = new Date(timeMs || Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const target = dir === "from" ? svc.destinationName : svc.sourceName;
+  li.innerHTML = `<span class="t">${ts}</span>
     <i class="dot" style="background:${COLORS[dir]}"></i>
-    <b>${svc.oprsNo || "?"}</b> ${verb} ${window.SELECTED.name} <span class="rt">${svc.destinationName || svc.sourceName || ""}</span>`;
+    <b>${svc.oprsNo || "?"}</b> ${verb} <span class="rt">${target || ""}</span>`;
   feed.prepend(li);
   while (feed.children.length > 15) feed.lastChild.remove();
-}
-
-/* ---------- schedule helpers (IST) ---------- */
-function nowMinIST() { const d = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" })); return d.getHours() * 60 + d.getMinutes(); }
-function hhmmToMin(t) { const m = /(\d{1,2}):(\d{2})/.exec(t || ""); return m ? +m[1] * 60 + +m[2] : null; }
-function wrap(d) { if (d > 720) d -= 1440; if (d < -720) d += 1440; return d; }
-// A not-live trip is worth checking only between (start - PRESTART_MIN) and (end + DONE_GRACE_MIN).
-function stillEligible(svc) {
-  const now = nowMinIST(), s = hhmmToMin(svc.serviceStartTime), e = hhmmToMin(svc.serviceEndTime);
-  if (e != null && wrap(now - e) > C.DONE_GRACE_MIN) return false;
-  if (s != null && wrap(s - now) > C.PRESTART_MIN) return false;
-  return true;
 }
 
 /* ---------- status ---------- */
@@ -241,16 +274,16 @@ function stamp() {
 /* ---------- live-position engine ----------
    Three tiers, each a self-scheduling loop (next run is scheduled only after the
    current one finishes, so slow networks never cause overlapping cycles):
-     view    live buses inside the padded viewport   every VIEW_MS
-     off     live buses elsewhere                    every OFFVIEW_MS
-     pending trips not live yet but due              every SLOW_MS  (catches starts)
+     view      live buses inside the padded viewport   every VIEW_MS
+     off       live buses elsewhere                    every OFFVIEW_MS
+     discover  re-query serviceDetails for new trips   every SLOW_MS
    All loops pause while the tab is hidden. */
 const engine = (() => {
-  let plan = [], ctl = null, timers = {}, running = {};
+  let plan = [], town = null, ctl = null, timers = {}, running = {};
   const TIERS = {
     view: { ms: () => C.VIEW_MS, pick: () => { const vb = viewBounds(); return plan.filter(p => p.live && vb.contains(buses.get(p.docId).to)); } },
     off: { ms: () => C.OFFVIEW_MS, pick: () => { const vb = viewBounds(); return plan.filter(p => p.live && !vb.contains(buses.get(p.docId).to)); } },
-    pending: { ms: () => C.SLOW_MS, pick: () => plan.filter(p => !p.live && stillEligible(p.svc)) },
+    discover: { ms: () => C.SLOW_MS },
   };
 
   // Fetch a set of trips in batches and apply the results.
@@ -260,6 +293,7 @@ const engine = (() => {
     const got = await batchTracking(items.map(p => p.docId), signal);
     if (signal.aborted) return;
     const now = Date.now();
+    const seededLive = [];
     for (const p of items) {
       const t = got.get(p.docId);
       const lt = t ? (+t.locationTime || +t.refreshedAt || 0) : 0;
@@ -269,29 +303,59 @@ const engine = (() => {
         const wasLive = p.live;
         upsertBus(p.docId, p.dir, p.svc, t);
         p.live = true;
-        if (!wasLive && !seed) {             // not-live -> live: a bus just started
+        if (seed) {
+          seededLive.push({ p, lt });
+        } else if (!wasLive) { // not-live -> live: a bus just started
           buses.get(p.docId).pulseUntil = performance.now() + 9000;
           kick();
           logEvent("start", p.dir, p.svc);
         }
-      } else if (p.live) {                     // was live, signal gone: left the road
+      } else if (p.live) { // was live, signal gone: left the road
         removeBus(p.docId);
         p.live = false;
         if (!seed) logEvent("stop", p.dir, p.svc);
       }
     }
+    if (seed && seededLive.length) {
+      seededLive.sort((a, b) => a.lt - b.lt);
+      for (const { p, lt } of seededLive.slice(-5)) logEvent("init", p.dir, p.svc, lt);
+    }
     setCounts();
+  }
+
+  async function discover() {
+    if (!town) return;
+    const signal = ctl.signal;
+    const latest = await fetchTownTrips(town, signal);
+    if (signal.aborted) return;
+    const known = new Set(plan.map(p => p.docId));
+    const added = [];
+    for (const item of latest) {
+      const docId = item.svc.serviceDocId;
+      if (!known.has(docId)) {
+        const entry = { dir: item.dir, svc: item.svc, docId, live: false };
+        plan.push(entry);
+        added.push(entry);
+      }
+    }
+    if (added.length) {
+      document.getElementById("countSched").textContent = plan.length;
+      await refresh(added, false);
+    }
   }
 
   let rerun = {};
   async function run(name) {
     clearTimeout(timers[name]);
     if (!ctl || document.hidden) return;
-    if (running[name]) { rerun[name] = true; return; }   // e.g. user panned mid-refresh: go again right after
+    if (running[name]) { rerun[name] = true; return; }
     running[name] = true;
     const mine = ctl;
-    try { await refresh(TIERS[name].pick(), false); } finally { running[name] = false; }
-    if (mine !== ctl || mine.signal.aborted) return;       // town changed meanwhile
+    try {
+      if (name === "discover") await discover();
+      else await refresh(TIERS[name].pick(), false);
+    } finally { running[name] = false; }
+    if (mine !== ctl || mine.signal.aborted) return;
     if (name === "view") stamp();
     if (rerun[name]) { rerun[name] = false; return run(name); }
     if (!document.hidden) timers[name] = setTimeout(() => run(name), TIERS[name].ms());
@@ -301,67 +365,33 @@ const engine = (() => {
   document.addEventListener("visibilitychange", () => {
     if (!ctl) return;
     if (document.hidden) stopTimers();
-    else { run("view"); run("off"); run("pending"); }   // catch up immediately on return
+    else { run("view"); run("off"); run("discover"); }
   });
 
   return {
     signal: () => ctl.signal,
-    reset() { if (ctl) ctl.abort(); stopTimers(); running = {}; rerun = {}; plan = []; ctl = new AbortController(); },
-    async start(newPlan) {
+    reset() { if (ctl) ctl.abort(); stopTimers(); running = {}; rerun = {}; plan = []; town = null; ctl = new AbortController(); },
+    async start(selectedTown, newPlan) {
+      town = selectedTown;
       plan = newPlan;
-      // Seed: check every trip once (batched). Many live buses sit outside their
-      // timetable window, so the first pass can't rely on the schedule.
       const mine = ctl;
       await refresh(plan, true);
       if (mine !== ctl || mine.signal.aborted) return;
       stamp();
-      run("view"); run("off"); run("pending");
+      run("view"); run("off");
+      timers.discover = setTimeout(() => run("discover"), TIERS.discover.ms());
     },
     bumpView() { if (ctl && !ctl.signal.aborted) run("view"); },
   };
 })();
 
-/* ---------- town selection + schedule sweep ---------- */
-const slim = x => ({ // keep only what the app uses (smaller cache, less memory)
-  serviceDocId: x.serviceDocId, oprsNo: x.oprsNo, serviceType: x.serviceType,
-  sourceName: x.sourceName, destinationName: x.destinationName,
-  serviceStartTime: x.serviceStartTime, serviceEndTime: x.serviceEndTime,
-});
-
-async function sweep(town, signal) {
-  const key = `sweep:${town[PID]}`;
-  try {
-    const c = JSON.parse(sessionStorage.getItem(key) || "null");
-    if (c && Date.now() - c.ts < C.SWEEP_CACHE_MIN * 60000) return c.plan;
-  } catch (_) { /* ignore bad cache */ }
-
-  const dests = candidates(town);
-  // Both directions in one pool. Key by serviceDocId (unique per trip/direction): a
-  // round trip shares one serviceId across both legs, so classify by start/end city.
-  const jobs = dests.flatMap(d => [["from", d], ["to", d]]);
-  const trips = new Map();
-  let step = 0;
-  await pool(jobs, C.SWEEP_CONCURRENCY, async ([dir, d]) => {
-    const rows = dir === "from" ? await fetchServices(town[PID], d[PID], signal) : await fetchServices(d[PID], town[PID], signal);
-    for (const x of rows) {
-      if (!x.serviceDocId) continue;
-      if (dir === "from" && x.startCityPlaceId === town[PID]) trips.set(x.serviceDocId, { dir, svc: slim(x) });
-      if (dir === "to" && x.endCityPlaceId === town[PID] && !trips.has(x.serviceDocId)) trips.set(x.serviceDocId, { dir, svc: slim(x) });
-    }
-    if (!signal.aborted) setStatus(`Querying schedules… ${++step}/${jobs.length}`);
-  });
-  const plan = [...trips.values()];
-  if (!signal.aborted) {
-    try { sessionStorage.setItem(key, JSON.stringify({ ts: Date.now(), plan })); } catch (_) { /* quota: skip cache */ }
-  }
-  return plan;
-}
-
+/* ---------- town selection ---------- */
 async function selectTown(town) {
   engine.reset();
   const signal = engine.signal();
   for (const id of [...buses.keys()]) removeBus(id);
   document.getElementById("feed").innerHTML = "";
+  document.getElementById("countSched").textContent = "…";
   window.SELECTED = { id: town[PID], name: town[NAME], row: town };
 
   map.setView([town[LAT], town[LON]], 11);
@@ -369,14 +399,14 @@ async function selectTown(town) {
   townMarker = L.circleMarker([town[LAT], town[LON]], { radius: 6, color: "#111", weight: 2, fillColor: "#fde047", fillOpacity: 1 })
     .addTo(map).bindTooltip(town[NAME]);
   setCounts();
-  setStatus(`Finding routes around ${town[NAME]}…`);
+  setStatus(`Loading trips for ${town[NAME]}…`);
 
-  const plan = await sweep(town, signal);
+  const plan = await fetchTownTrips(town, signal);
   if (signal.aborted) return;
   for (const p of plan) { p.docId = p.svc.serviceDocId; p.live = false; }
   document.getElementById("countSched").textContent = plan.length;
-  setStatus(`${plan.length} scheduled trips. Checking live GPS…`);
-  await engine.start(plan);
+  setStatus(`${plan.length} trips today. Checking live GPS…`);
+  await engine.start(town, plan);
 }
 
 /* ---------- searchable town dropdown ---------- */

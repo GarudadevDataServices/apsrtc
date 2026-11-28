@@ -9,6 +9,7 @@ Output row format: [placeId, linkPlaceId(0 if same), name, mandal, district, lat
 flags: 1 = mandal headquarters (name == mandal), 2 = depot town
 """
 import json
+import re
 import sys
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -34,7 +35,10 @@ def main() -> None:
         places = get("/mappedplaces/fetchAllUniquePlaces")
         services = get("/servicesnumbers/all")
 
-    depots = {s["serviceDocId"].rsplit("_", 1)[-1].strip().upper() for s in services["data"]}
+    depots = {
+        re.sub(r"[-\s]+\d+$", "", s["serviceDocId"].rsplit("_", 1)[-1].strip().upper())
+        for s in services["data"]
+    }
 
     rows = []
     for p in places["miniServicePlaces"]:
