@@ -133,9 +133,9 @@ async function fetchTownTrips(town, signal) {
     if (!trips.has(svc.serviceDocId)) trips.set(svc.serviceDocId, { dir: "to", svc });
   }
 
-  // For intermediate villages/non-depot stops (or towns with few direct trips),
-  // also check the 5 nearest depot towns and keep any trip whose wayPointString passes through here.
-  if (!(town[FLAGS] & 2) || trips.size < 15) {
+  // For villages, stops, and regional towns (< 400 direct trips), also check the
+  // 5 nearest depot towns so buses passing through (e.g. Chirala <-> Repalle via Bapatla) appear.
+  if (trips.size < 400) {
     const pidStr = String(town[PID]);
     const depots = nearestDepots(town, 5);
     const extraJobs = depots.flatMap(d => [
