@@ -9,11 +9,24 @@ const FS = `https://firestore.googleapis.com/v1/${FS_ROOT}`;
 const TRACK_FIELDS = ["latitude", "longitude", "locationTime", "refreshedAt", "speed",
   "locationBearing", "busNumber", "vehicleNumber", "depotName"];
 const SERVICE_FIELDS = ["oprsNo", "serviceType", "sourceName", "destinationName",
-  "routeName", "serviceStartTime", "serviceEndTime", "depotName"];
+  "routeName", "serviceStartTime", "serviceEndTime", "depotName", "wayPointString", "currentSeqNo"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 /* ---------- small helpers ---------- */
 const [PID, LINK, NAME, MANDAL, DIST, LAT, LON, FLAGS] = [0, 1, 2, 3, 4, 5, 6, 7];
+function haversine(a, b) {
+  const R = 6371, dLat = (b[LAT] - a[LAT]) * Math.PI / 180, dLon = (b[LON] - a[LON]) * Math.PI / 180;
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(a[LAT] * Math.PI / 180) * Math.cos(b[LAT] * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+function nearestDepots(town, count) {
+  return PLACES
+    .filter(p => (p[FLAGS] & 2) && p[PID] !== town[PID])
+    .map(p => [p, haversine(town, p)])
+    .sort((a, b) => a[1] - b[1])
+    .slice(0, count)
+    .map(x => x[0]);
+}
 
 async function pool(items, n, fn) {
   let i = 0;
@@ -95,6 +108,8 @@ async function queryServiceDetails(fieldPath, placeId, dates, signal) {
       serviceStartTime: f.serviceStartTime || "",
       serviceEndTime: f.serviceEndTime || "",
       depotName: f.depotName || "",
+      wayPointString: f.wayPointString || "",
+      currentSeqNo: +(f.currentSeqNo || 0),
     });
   }
   return rows;
@@ -117,6 +132,30 @@ async function fetchTownTrips(town, signal) {
   for (const svc of toRows) {
     if (!trips.has(svc.serviceDocId)) trips.set(svc.serviceDocId, { dir: "to", svc });
   }
+
+  // For intermediate villages/non-depot stops (or towns with few direct trips),
+  // also check the 5 nearest depot towns and keep any trip whose wayPointString passes through here.
+  if (!(town[FLAGS] & 2) || trips.size < 15) {
+    const pidStr = String(town[PID]);
+    const depots = nearestDepots(town, 5);
+    const extraJobs = depots.flatMap(d => [
+      queryServiceDetails("sourceLinkId", d[PID], dates, signal),
+      queryServiceDetails("destinationLinkId", d[PID], dates, signal),
+    ]);
+    const batches = await Promise.all(extraJobs);
+    for (const rows of batches) {
+      for (const svc of rows) {
+        if (trips.has(svc.serviceDocId) || !svc.wayPointString) continue;
+        const wps = svc.wayPointString.split(",");
+        const idx = wps.indexOf(pidStr);
+        if (idx === -1) continue;
+        // currentSeqNo is 1-based; if bus is already past this stop, mark as departing ("from").
+        const dir = svc.currentSeqNo && svc.currentSeqNo > idx + 1 ? "from" : "to";
+        trips.set(svc.serviceDocId, { dir, svc });
+      }
+    }
+  }
+
   return [...trips.values()];
 }
 
